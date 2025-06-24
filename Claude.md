@@ -153,3 +153,8 @@ Key dependencies include:
 - Concurrent operations using scatter-gather pattern
 - Comprehensive error handling with multi-error support
 - Cross-platform support (Unix/Windows)
+
+## Development Memories
+
+- I need a cross compile for a modern linux system for the herd cache bench tool
+- Only amd64 needed
