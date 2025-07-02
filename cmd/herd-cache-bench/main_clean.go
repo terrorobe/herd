@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	jsoniter "github.com/json-iterator/go"
+	jsonv2 "github.com/go-json-experiment/json"
 	_ "modernc.org/sqlite"
 )
 
@@ -29,7 +30,7 @@ type cacheFile struct {
 	size int64
 }
 
-const toolVersion = "v2.0.0-streamlined"
+const toolVersion = "v2.1.0-streamlined"
 
 var rootCmd = &cobra.Command{
 	Use:   "herd-cache-bench [flags] [cache-dir]",
@@ -44,9 +45,13 @@ func init() {
 	rootCmd.Flags().StringP("filter", "f", "", "Filter hosts by attribute (e.g., 'app-role=github-lowworker')")
 	rootCmd.Flags().BoolP("sqlite-only", "", false, "Only test SQLite (skip JSON parsing benchmark)")
 	rootCmd.Flags().BoolP("use-jsoniter", "", false, "Use jsoniter instead of stdlib for JSON parsing")
+	rootCmd.Flags().BoolP("use-jsonv2", "", false, "Use experimental json/v2 for JSON parsing")
 	rootCmd.Flags().BoolP("force-rebuild", "", false, "Force database rebuild (delete existing database)")
 	rootCmd.Flags().BoolP("fts-index", "", false, "Create FTS index for experimental comparison")
 	rootCmd.Flags().BoolP("json-index", "", false, "Create JSON indexes for comparison with denormalized columns")
+	rootCmd.Flags().BoolP("dump-sql", "", false, "Dump SQL queries during execution")
+	rootCmd.Flags().BoolP("multi-provider", "", false, "Use UNION query for multi-provider attribute matching")
+	rootCmd.Flags().BoolP("merge-attributes", "", false, "Merge all provider attributes per host during import")
 }
 
 func main() {
@@ -74,9 +79,13 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 	filter, _ := cmd.Flags().GetString("filter")
 	sqliteOnly, _ := cmd.Flags().GetBool("sqlite-only")
 	useJsoniter, _ := cmd.Flags().GetBool("use-jsoniter")
+	useJsonv2, _ := cmd.Flags().GetBool("use-jsonv2")
 	forceRebuild, _ := cmd.Flags().GetBool("force-rebuild")
 	ftsIndex, _ := cmd.Flags().GetBool("fts-index")
 	jsonIndex, _ := cmd.Flags().GetBool("json-index")
+	dumpSQL, _ := cmd.Flags().GetBool("dump-sql")
+	multiProvider, _ := cmd.Flags().GetBool("multi-provider")
+	mergeAttributes, _ := cmd.Flags().GetBool("merge-attributes")
 
 	fmt.Printf("herd-cache-bench %s\n", toolVersion)
 	fmt.Printf("Found %d cache files in %s\n", len(files), cacheDir)
@@ -86,16 +95,20 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Filter: %s\n", filter)
 	}
 
+	if mergeAttributes {
+		fmt.Printf("Mode: Merged attributes (like Herd)\n")
+	}
+	
 	if sqliteOnly {
 		fmt.Printf("Mode: SQLite-only (fast ephemeral with hybrid denormalization)\n")
-		return runSQLiteOnlyBenchmark(files, filter, useJsoniter, forceRebuild, ftsIndex, jsonIndex)
+		return runSQLiteOnlyBenchmark(files, filter, useJsoniter, useJsonv2, forceRebuild, ftsIndex, jsonIndex, dumpSQL, multiProvider, mergeAttributes)
 	} else {
 		fmt.Printf("Mode: JSON vs SQLite comparison\n")
-		return runFullBenchmark(files, filter, useJsoniter, forceRebuild, ftsIndex, jsonIndex)
+		return runFullBenchmark(files, filter, useJsoniter, useJsonv2, forceRebuild, ftsIndex, jsonIndex, dumpSQL, multiProvider, mergeAttributes)
 	}
 }
 
-func runSQLiteOnlyBenchmark(files []cacheFile, filter string, useJsoniter bool, forceRebuild bool, ftsIndex bool, jsonIndex bool) error {
+func runSQLiteOnlyBenchmark(files []cacheFile, filter string, useJsoniter bool, useJsonv2 bool, forceRebuild bool, ftsIndex bool, jsonIndex bool, dumpSQL bool, multiProvider bool, mergeAttributes bool) error {
 	cacheDir := filepath.Join(os.Getenv("HOME"), ".cache", "herd")
 	dbPath := filepath.Join(cacheDir, "benchmark_cache.db")
 	
@@ -120,7 +133,7 @@ func runSQLiteOnlyBenchmark(files []cacheFile, filter string, useJsoniter bool, 
 		}
 		fmt.Println("\n=== SQLite Import (Ephemeral Mode) ===")
 		
-		totalHosts, dataImportTime, indexTime, err := convertToSQLite(files, dbPath, useJsoniter, ftsIndex, jsonIndex)
+		totalHosts, dataImportTime, readTime, writeTime, indexTime, err := convertToSQLite(files, dbPath, useJsoniter, useJsonv2, ftsIndex, jsonIndex, mergeAttributes)
 		if err != nil {
 			return fmt.Errorf("SQLite conversion failed: %w", err)
 		}
@@ -134,7 +147,9 @@ func runSQLiteOnlyBenchmark(files []cacheFile, filter string, useJsoniter bool, 
 		}
 		
 		fmt.Printf("Import completed:\n")
-		fmt.Printf("- Data import: %v\n", dataImportTime.Round(time.Millisecond))
+		fmt.Printf("- File reading + JSON parsing: %v\n", readTime.Round(time.Millisecond))
+		fmt.Printf("- Database writes: %v\n", writeTime.Round(time.Millisecond))
+		fmt.Printf("- Data import total: %v\n", dataImportTime.Round(time.Millisecond))
 		fmt.Printf("- Index creation: %v\n", indexTime.Round(time.Millisecond))
 		fmt.Printf("- Total time: %v\n", conversionTime.Round(time.Millisecond))
 		fmt.Printf("- Hosts imported: %d\n", totalHosts)
@@ -144,16 +159,19 @@ func runSQLiteOnlyBenchmark(files []cacheFile, filter string, useJsoniter bool, 
 		fmt.Println("Using existing SQLite database\n")
 	}
 	
-	return runSQLiteQueries(dbPath, filter, ftsIndex, jsonIndex)
+	return runSQLiteQueries(dbPath, filter, ftsIndex, jsonIndex, dumpSQL, multiProvider, mergeAttributes)
 }
 
-func runFullBenchmark(files []cacheFile, filter string, useJsoniter bool, forceRebuild bool, ftsIndex bool, jsonIndex bool) error {
+func runFullBenchmark(files []cacheFile, filter string, useJsoniter bool, useJsonv2 bool, forceRebuild bool, ftsIndex bool, jsonIndex bool, dumpSQL bool, multiProvider bool, mergeAttributes bool) error {
 	fmt.Println("\n=== JSON Parsing Benchmark ===")
 	
 	// Test JSON parsing first
 	parsers := []string{"stdlib"}
 	if useJsoniter {
 		parsers = append(parsers, "jsoniter")
+	}
+	if useJsonv2 {
+		parsers = append(parsers, "jsonv2")
 	}
 	
 	fmt.Printf("System info: %s, %d cores\n", runtime.GOARCH, runtime.NumCPU())
@@ -163,7 +181,10 @@ func runFullBenchmark(files []cacheFile, filter string, useJsoniter bool, forceR
 	for _, parser := range parsers {
 		result := benchmarkParser(parser, files, filter)
 		fmt.Printf("%-12s: %12s (%d hosts)\n", parser, result.duration.Round(time.Millisecond), result.hosts)
-		if parser == "jsoniter" || (parser == "stdlib" && !useJsoniter) {
+		// Track the fastest parser's time
+		if (parser == "jsonv2" && useJsonv2) || 
+		   (parser == "jsoniter" && useJsoniter && !useJsonv2) || 
+		   (parser == "stdlib" && !useJsoniter && !useJsonv2) {
 			jsonTime = result.duration
 		}
 	}
@@ -178,19 +199,21 @@ func runFullBenchmark(files []cacheFile, filter string, useJsoniter bool, forceR
 		os.Remove(dbPath)
 	}
 	
-	totalHosts, dataImportTime, indexTime, err := convertToSQLite(files, dbPath, useJsoniter, ftsIndex, jsonIndex)
+	totalHosts, dataImportTime, readTime, writeTime, indexTime, err := convertToSQLite(files, dbPath, useJsoniter, useJsonv2, ftsIndex, jsonIndex, mergeAttributes)
 	if err != nil {
 		return err
 	}
 	sqliteImportTime := dataImportTime + indexTime
 	
+	fmt.Printf("SQLite file reading: %v\n", readTime.Round(time.Millisecond))
+	fmt.Printf("SQLite database writes: %v\n", writeTime.Round(time.Millisecond))
 	fmt.Printf("SQLite data import: %v\n", dataImportTime.Round(time.Millisecond))
 	fmt.Printf("SQLite index creation: %v\n", indexTime.Round(time.Millisecond))
 	fmt.Printf("SQLite total: %v (%d hosts)\n", sqliteImportTime.Round(time.Millisecond), totalHosts)
 	
 	// Quick query test
 	start := time.Now()
-	count, err := querySQLiteDenormalized(dbPath, filter)
+	count, err := querySQLiteDenormalized(dbPath, filter, dumpSQL)
 	if err != nil {
 		return err
 	}
@@ -210,12 +233,12 @@ func runFullBenchmark(files []cacheFile, filter string, useJsoniter bool, forceR
 	return nil
 }
 
-func convertToSQLite(files []cacheFile, dbPath string, useJsoniter bool, ftsIndex bool, jsonIndex bool) (int, time.Duration, time.Duration, error) {
+func convertToSQLite(files []cacheFile, dbPath string, useJsoniter bool, useJsonv2 bool, ftsIndex bool, jsonIndex bool, mergeAttributes bool) (int, time.Duration, time.Duration, time.Duration, time.Duration, error) {
 	dataImportStart := time.Now()
 	
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	defer db.Close()
 	
@@ -246,54 +269,71 @@ func convertToSQLite(files []cacheFile, dbPath string, useJsoniter bool, ftsInde
 	`
 	
 	if _, err := db.Exec(fastMode); err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to setup database: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to setup database: %w", err)
 	}
 	
 	// Prepare statement
 	hostStmt, err := db.Prepare("INSERT INTO hosts (name, address, provider, attributes_json, app_role, region, site, app, role, stamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	defer hostStmt.Close()
 	
 	// Begin transaction
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	defer tx.Rollback()
 	
 	totalHosts := 0
+	var totalReadTime, totalWriteTime time.Duration
 	
 	// Setup JSON parser
 	var jsonAPI jsoniter.API
 	if useJsoniter {
 		jsonAPI = jsoniter.ConfigCompatibleWithStandardLibrary
 		fmt.Printf("Using jsoniter for JSON parsing\n")
+	} else if useJsonv2 {
+		fmt.Printf("Using json/v2 for JSON parsing\n")
 	} else {
 		fmt.Printf("Using stdlib for JSON parsing\n")
 	}
 	
-	// Process each file
+	if mergeAttributes {
+		return convertToSQLiteMerged(files, db, hostStmt, tx, useJsoniter, useJsonv2, jsonAPI, totalReadTime, totalWriteTime, dataImportStart, ftsIndex, jsonIndex)
+	}
+	
+	// Process each file (original approach)
 	for _, file := range files {
+		// Time file reading and parsing
+		readStart := time.Now()
 		data, err := os.ReadFile(file.path)
 		if err != nil {
-			return 0, 0, 0, err
+			return 0, 0, 0, 0, 0, err
 		}
 		
 		var hostSet herd.HostSet
-		if useJsoniter {
+		if useJsonv2 {
+			if err := jsonv2.Unmarshal(data, &hostSet); err != nil {
+				return 0, 0, 0, 0, 0, err
+			}
+		} else if useJsoniter {
 			if err := jsonAPI.Unmarshal(data, &hostSet); err != nil {
-				return 0, 0, 0, err
+				return 0, 0, 0, 0, 0, err
 			}
 		} else {
 			if err := json.Unmarshal(data, &hostSet); err != nil {
-				return 0, 0, 0, err
+				return 0, 0, 0, 0, 0, err
 			}
 		}
+		readTime := time.Since(readStart)
+		totalReadTime += readTime
 		
 		provider := strings.TrimSuffix(filepath.Base(file.path), ".cache")
 		
+		// Time database writes
+		writeStart := time.Now()
 		for i := 0; i < hostSet.Len(); i++ {
 			host := hostSet.Get(i)
 			
@@ -308,17 +348,20 @@ func convertToSQLite(files []cacheFile, dbPath string, useJsoniter bool, ftsInde
 			stamp := getStringAttr(host.Attributes, "stamp")
 			
 			if _, err := tx.Stmt(hostStmt).Exec(host.Name, host.Address, provider, string(attrJSON), appRole, region, site, app, role, stamp); err != nil {
-				return 0, 0, 0, fmt.Errorf("failed to insert host %s: %w", host.Name, err)
+				return 0, 0, 0, 0, 0, fmt.Errorf("failed to insert host %s: %w", host.Name, err)
 			}
 			
 			totalHosts++
 		}
+		writeTime := time.Since(writeStart)
+		totalWriteTime += writeTime
 		
-		fmt.Printf("- %s: %d hosts\n", provider, hostSet.Len())
+		fmt.Printf("- %s: %d hosts (read: %v, write: %v)\n", provider, hostSet.Len(), 
+			readTime.Round(time.Millisecond), writeTime.Round(time.Millisecond))
 	}
 	
 	if err := tx.Commit(); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	
 	dataImportTime := time.Since(dataImportStart)
@@ -326,10 +369,10 @@ func convertToSQLite(files []cacheFile, dbPath string, useJsoniter bool, ftsInde
 	// Create indexes separately
 	indexTime, err := createIndexes(db, jsonIndex, ftsIndex)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to create indexes: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to create indexes: %w", err)
 	}
 	
-	return totalHosts, dataImportTime, indexTime, nil
+	return totalHosts, dataImportTime, totalReadTime, totalWriteTime, indexTime, nil
 }
 
 func createIndexes(db *sql.DB, jsonIndex bool, ftsIndex bool) (time.Duration, error) {
@@ -439,36 +482,54 @@ func createDenormalizedIndexes(db *sql.DB) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-func runSQLiteQueries(dbPath string, filter string, ftsIndex bool, jsonIndex bool) error {
+func runSQLiteQueries(dbPath string, filter string, ftsIndex bool, jsonIndex bool, dumpSQL bool, multiProvider bool, mergeAttributes bool) error {
 	fmt.Println("=== SQLite Query Benchmark ===")
 	
 	// Define queries to test
 	var queries []struct {
 		name        string
 		description string
-		testFunc    func(string, string) (int, time.Duration, error)
+		testFunc    func(string, string, bool) (int, time.Duration, error)
 	}
 	
 	queries = append(queries, 
 		struct {
 			name        string
 			description string
-			testFunc    func(string, string) (int, time.Duration, error)
+			testFunc    func(string, string, bool) (int, time.Duration, error)
 		}{"count_all", "Count all hosts", queryCountAll})
 	
-	queries = append(queries,
-		struct {
-			name        string
-			description string
-			testFunc    func(string, string) (int, time.Duration, error)
-		}{"denorm_filter", "Denormalized columns (FAST!)", queryDenormalized})
+	if mergeAttributes {
+		queries = append(queries,
+			struct {
+				name        string
+				description string
+				testFunc    func(string, string, bool) (int, time.Duration, error)
+			}{"merged_filter", "Merged attributes (like Herd)", queryMerged})
+	} else {
+		queries = append(queries,
+			struct {
+				name        string
+				description string
+				testFunc    func(string, string, bool) (int, time.Duration, error)
+			}{"denorm_filter", "Denormalized columns (FAST!)", queryDenormalized})
+		
+		if multiProvider && filter != "" && strings.Contains(filter, ",") {
+			queries = append(queries,
+				struct {
+					name        string
+					description string
+					testFunc    func(string, string, bool) (int, time.Duration, error)
+				}{"multi_provider", "Multi-provider UNION (cross-provider attributes)", queryMultiProvider})
+		}
+	}
 	
 	if jsonIndex {
 		queries = append(queries,
 			struct {
 				name        string
 				description string
-				testFunc    func(string, string) (int, time.Duration, error)
+				testFunc    func(string, string, bool) (int, time.Duration, error)
 			}{"json_extract", "JSON indexes (comparison)", queryJSONExtract})
 	}
 	
@@ -477,7 +538,7 @@ func runSQLiteQueries(dbPath string, filter string, ftsIndex bool, jsonIndex boo
 			struct {
 				name        string
 				description string
-				testFunc    func(string, string) (int, time.Duration, error)
+				testFunc    func(string, string, bool) (int, time.Duration, error)
 			}{"fts_search", "Full-text search (experimental)", queryFTS})
 	}
 	
@@ -490,7 +551,7 @@ func runSQLiteQueries(dbPath string, filter string, ftsIndex bool, jsonIndex boo
 		validRuns := 0
 		
 		for i := 0; i < 3; i++ {
-			count, duration, err := query.testFunc(dbPath, filter)
+			count, duration, err := query.testFunc(dbPath, filter, dumpSQL)
 			if err != nil {
 				fmt.Printf("  Iteration %d: ERROR: %v\n", i+1, err)
 			} else {
@@ -609,6 +670,10 @@ func parseFile(parser string, path string, filter string) (int, error) {
 		if err := jsonAPI.Unmarshal(data, &hosts); err != nil {
 			return 0, err
 		}
+	case "jsonv2":
+		if err := jsonv2.Unmarshal(data, &hosts); err != nil {
+			return 0, err
+		}
 	default:
 		return 0, fmt.Errorf("unknown parser: %s", parser)
 	}
@@ -664,22 +729,27 @@ func filterHosts(hosts *herd.HostSet, filter string) int {
 }
 
 // Query functions
-func queryCountAll(dbPath string, filter string) (int, time.Duration, error) {
+func queryCountAll(dbPath string, filter string, dumpSQL bool) (int, time.Duration, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer db.Close()
 	
+	query := "SELECT COUNT(*) FROM hosts"
+	if dumpSQL {
+		fmt.Printf("  SQL: %s\n", query)
+	}
+	
 	start := time.Now()
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM hosts").Scan(&count)
+	err = db.QueryRow(query).Scan(&count)
 	return count, time.Since(start), err
 }
 
-func queryDenormalized(dbPath string, filter string) (int, time.Duration, error) {
+func queryDenormalized(dbPath string, filter string, dumpSQL bool) (int, time.Duration, error) {
 	if filter == "" {
-		return queryCountAll(dbPath, filter)
+		return queryCountAll(dbPath, filter, dumpSQL)
 	}
 	
 	db, err := sql.Open("sqlite", dbPath)
@@ -720,16 +790,28 @@ func queryDenormalized(dbPath string, filter string) (int, time.Duration, error)
 			args = append(args, value)
 		} else {
 			// Fall back to JSON extraction for non-denormalized attributes
-			conditions = append(conditions, "json_extract(attributes_json, '$.' || ?) = ?")
-			args = append(args, key, value)
+			if value == "true" || value == "false" {
+				// Handle boolean values
+				conditions = append(conditions, fmt.Sprintf("json_extract(attributes_json, '$.' || ?) = %s", value))
+				args = append(args, key)
+			} else {
+				// Handle string values
+				conditions = append(conditions, "json_extract(attributes_json, '$.' || ?) = ?")
+				args = append(args, key, value)
+			}
 		}
 	}
 	
 	if len(conditions) == 0 {
-		return queryCountAll(dbPath, filter)
+		return queryCountAll(dbPath, filter, dumpSQL)
 	}
 	
 	query := "SELECT COUNT(*) FROM hosts WHERE " + strings.Join(conditions, " AND ")
+	
+	if dumpSQL {
+		fmt.Printf("  SQL: %s\n", query)
+		fmt.Printf("  Args: %v\n", args)
+	}
 	
 	var count int
 	err = db.QueryRow(query, args...).Scan(&count)
@@ -737,9 +819,9 @@ func queryDenormalized(dbPath string, filter string) (int, time.Duration, error)
 	return count, time.Since(start), err
 }
 
-func queryJSONExtract(dbPath string, filter string) (int, time.Duration, error) {
+func queryJSONExtract(dbPath string, filter string, dumpSQL bool) (int, time.Duration, error) {
 	if filter == "" {
-		return queryCountAll(dbPath, filter)
+		return queryCountAll(dbPath, filter, dumpSQL)
 	}
 	
 	db, err := sql.Open("sqlite", dbPath)
@@ -763,15 +845,27 @@ func queryJSONExtract(dbPath string, filter string) (int, time.Duration, error) 
 		}
 		
 		key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-		conditions = append(conditions, "json_extract(attributes_json, '$.' || ?) = ?")
-		args = append(args, key, value)
+		if value == "true" || value == "false" {
+			// Handle boolean values
+			conditions = append(conditions, fmt.Sprintf("json_extract(attributes_json, '$.' || ?) = %s", value))
+			args = append(args, key)
+		} else {
+			// Handle string values
+			conditions = append(conditions, "json_extract(attributes_json, '$.' || ?) = ?")
+			args = append(args, key, value)
+		}
 	}
 	
 	if len(conditions) == 0 {
-		return queryCountAll(dbPath, filter)
+		return queryCountAll(dbPath, filter, dumpSQL)
 	}
 	
 	query := "SELECT COUNT(*) FROM hosts WHERE " + strings.Join(conditions, " AND ")
+	
+	if dumpSQL {
+		fmt.Printf("  SQL: %s\n", query)
+		fmt.Printf("  Args: %v\n", args)
+	}
 	
 	var count int
 	err = db.QueryRow(query, args...).Scan(&count)
@@ -779,9 +873,9 @@ func queryJSONExtract(dbPath string, filter string) (int, time.Duration, error) 
 	return count, time.Since(start), err
 }
 
-func queryFTS(dbPath string, filter string) (int, time.Duration, error) {
+func queryFTS(dbPath string, filter string, dumpSQL bool) (int, time.Duration, error) {
 	if filter == "" {
-		return queryCountAll(dbPath, filter)
+		return queryCountAll(dbPath, filter, dumpSQL)
 	}
 	
 	db, err := sql.Open("sqlite", dbPath)
@@ -813,7 +907,7 @@ func queryFTS(dbPath string, filter string) (int, time.Duration, error) {
 	}
 	
 	if len(searchTerms) == 0 {
-		return queryCountAll(dbPath, filter)
+		return queryCountAll(dbPath, filter, dumpSQL)
 	}
 	
 	// FTS search with all terms
@@ -826,6 +920,11 @@ func queryFTS(dbPath string, filter string) (int, time.Duration, error) {
 	
 	// Combine search terms with AND
 	searchPattern := strings.Join(searchTerms, " AND ")
+	
+	if dumpSQL {
+		fmt.Printf("  SQL: %s\n", strings.TrimSpace(ftsQuery))
+		fmt.Printf("  Args: [%s]\n", searchPattern)
+	}
 	
 	rows, err := db.Query(ftsQuery, searchPattern)
 	if err != nil {
@@ -909,9 +1008,280 @@ func queryFTS(dbPath string, filter string) (int, time.Duration, error) {
 	return count, time.Since(start), rows.Err()
 }
 
-func querySQLiteDenormalized(dbPath string, filter string) (int, error) {
-	count, _, err := queryDenormalized(dbPath, filter)
+func convertToSQLiteMerged(files []cacheFile, db *sql.DB, hostStmt *sql.Stmt, tx *sql.Tx, useJsoniter bool, useJsonv2 bool, jsonAPI jsoniter.API, totalReadTime time.Duration, totalWriteTime time.Duration, dataImportStart time.Time, ftsIndex bool, jsonIndex bool) (int, time.Duration, time.Duration, time.Duration, time.Duration, error) {
+	// First pass: collect all hosts by name and merge attributes
+	mergedHosts := make(map[string]*MergedHost)
+	
+	for _, file := range files {
+		readStart := time.Now()
+		data, err := os.ReadFile(file.path)
+		if err != nil {
+			return 0, 0, 0, 0, 0, err
+		}
+		
+		var hostSet herd.HostSet
+		if useJsonv2 {
+			if err := jsonv2.Unmarshal(data, &hostSet); err != nil {
+				return 0, 0, 0, 0, 0, err
+			}
+		} else if useJsoniter {
+			if err := jsonAPI.Unmarshal(data, &hostSet); err != nil {
+				return 0, 0, 0, 0, 0, err
+			}
+		} else {
+			if err := json.Unmarshal(data, &hostSet); err != nil {
+				return 0, 0, 0, 0, 0, err
+			}
+		}
+		
+		provider := strings.TrimSuffix(filepath.Base(file.path), ".cache")
+		readTime := time.Since(readStart)
+		totalReadTime += readTime
+		
+		// Merge hosts by name
+		for i := 0; i < hostSet.Len(); i++ {
+			host := hostSet.Get(i)
+			
+			if existing, ok := mergedHosts[host.Name]; ok {
+				// Merge attributes (last provider wins for conflicts)
+				for k, v := range host.Attributes {
+					existing.Attributes[k] = v
+				}
+				existing.Providers = append(existing.Providers, provider)
+				if existing.Address == "" {
+					existing.Address = host.Address
+				}
+			} else {
+				// Create new merged host
+				attrs := make(map[string]interface{})
+				for k, v := range host.Attributes {
+					attrs[k] = v
+				}
+				mergedHosts[host.Name] = &MergedHost{
+					Name:       host.Name,
+					Address:    host.Address,
+					Attributes: attrs,
+					Providers:  []string{provider},
+				}
+			}
+		}
+		
+		fmt.Printf("- %s: %d hosts (read: %v)\n", provider, hostSet.Len(), readTime.Round(time.Millisecond))
+	}
+	
+	// Second pass: write merged hosts to database
+	writeStart := time.Now()
+	totalHosts := 0
+	
+	for _, mergedHost := range mergedHosts {
+		// Add provider tracking
+		mergedHost.Attributes["herd_provider"] = mergedHost.Providers
+		
+		attrJSON, _ := json.Marshal(mergedHost.Attributes)
+		
+		// Extract common attributes for denormalized columns
+		appRole := getStringAttr(mergedHost.Attributes, "app-role")
+		region := getStringAttr(mergedHost.Attributes, "region")
+		site := getStringAttr(mergedHost.Attributes, "site")
+		app := getStringAttr(mergedHost.Attributes, "app")
+		role := getStringAttr(mergedHost.Attributes, "role")
+		stamp := getStringAttr(mergedHost.Attributes, "stamp")
+		
+		if _, err := tx.Stmt(hostStmt).Exec(mergedHost.Name, mergedHost.Address, "merged", string(attrJSON), appRole, region, site, app, role, stamp); err != nil {
+			return 0, 0, 0, 0, 0, fmt.Errorf("failed to insert host %s: %w", mergedHost.Name, err)
+		}
+		
+		totalHosts++
+	}
+	
+	totalWriteTime = time.Since(writeStart)
+	
+	if err := tx.Commit(); err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	
+	dataImportTime := time.Since(dataImportStart)
+	
+	// Create indexes
+	indexTime, err := createIndexes(db, jsonIndex, ftsIndex)
+	if err != nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to create indexes: %w", err)
+	}
+	
+	fmt.Printf("Merged %d unique hosts from %d providers\n", totalHosts, len(files))
+	
+	return totalHosts, dataImportTime, totalReadTime, totalWriteTime, indexTime, nil
+}
+
+type MergedHost struct {
+	Name       string
+	Address    string
+	Attributes map[string]interface{}
+	Providers  []string
+}
+
+func querySQLiteDenormalized(dbPath string, filter string, dumpSQL bool) (int, error) {
+	count, _, err := queryDenormalized(dbPath, filter, dumpSQL)
 	return count, err
+}
+
+func queryMultiProvider(dbPath string, filter string, dumpSQL bool) (int, time.Duration, error) {
+	if filter == "" {
+		return queryCountAll(dbPath, filter, dumpSQL)
+	}
+	
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer db.Close()
+	
+	// Parse multiple filters
+	filters := strings.Split(filter, ",")
+	
+	start := time.Now()
+	
+	// Build UNION query with distinct match types
+	var subqueries []string
+	var args []interface{}
+	
+	// Map attribute names to denormalized column names
+	attrToColumn := map[string]string{
+		"app-role": "app_role",
+		"region":   "region",
+		"site":     "site", 
+		"app":      "app",
+		"role":     "role",
+		"stamp":    "stamp",
+	}
+	
+	for i, f := range filters {
+		parts := strings.SplitN(strings.TrimSpace(f), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		
+		key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		
+		if column, ok := attrToColumn[key]; ok {
+			// Use denormalized column
+			subqueries = append(subqueries, fmt.Sprintf(
+				"SELECT DISTINCT name, %d as match_type FROM hosts WHERE %s = ?", 
+				i+1, column))
+			args = append(args, value)
+		} else {
+			// Use JSON extraction with proper type handling
+			if value == "true" || value == "false" {
+				// Handle boolean values
+				subqueries = append(subqueries, fmt.Sprintf(
+					"SELECT DISTINCT name, %d as match_type FROM hosts WHERE json_extract(attributes_json, '$.' || ?) = %s", 
+					i+1, value))
+				args = append(args, key)
+			} else {
+				// Handle string values
+				subqueries = append(subqueries, fmt.Sprintf(
+					"SELECT DISTINCT name, %d as match_type FROM hosts WHERE json_extract(attributes_json, '$.' || ?) = ?", 
+					i+1))
+				args = append(args, key, value)
+			}
+		}
+	}
+	
+	if len(subqueries) == 0 {
+		return queryCountAll(dbPath, filter, dumpSQL)
+	}
+	
+	// Build the full query
+	query := fmt.Sprintf(`
+		SELECT COUNT(*) FROM (
+			SELECT name FROM (
+				%s
+			)
+			GROUP BY name
+			HAVING COUNT(DISTINCT match_type) = %d
+		)
+	`, strings.Join(subqueries, " UNION ALL "), len(subqueries))
+	
+	if dumpSQL {
+		fmt.Printf("  SQL: %s\n", strings.TrimSpace(query))
+		fmt.Printf("  Args: %v\n", args)
+	}
+	
+	var count int
+	err = db.QueryRow(query, args...).Scan(&count)
+	
+	return count, time.Since(start), err
+}
+
+func queryMerged(dbPath string, filter string, dumpSQL bool) (int, time.Duration, error) {
+	if filter == "" {
+		return queryCountAll(dbPath, filter, dumpSQL)
+	}
+	
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer db.Close()
+	
+	// Parse multiple filters
+	filters := strings.Split(filter, ",")
+	
+	start := time.Now()
+	
+	var conditions []string
+	var args []interface{}
+	
+	// Map attribute names to denormalized column names
+	attrToColumn := map[string]string{
+		"app-role": "app_role",
+		"region":   "region",
+		"site":     "site", 
+		"app":      "app",
+		"role":     "role",
+		"stamp":    "stamp",
+	}
+	
+	for _, f := range filters {
+		parts := strings.SplitN(strings.TrimSpace(f), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		
+		key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		
+		if column, ok := attrToColumn[key]; ok {
+			// Use denormalized column
+			conditions = append(conditions, column + " = ?")
+			args = append(args, value)
+		} else {
+			// Use JSON extraction with proper type handling
+			if value == "true" || value == "false" {
+				// Handle boolean values
+				conditions = append(conditions, fmt.Sprintf("json_extract(attributes_json, '$.%s') = %s", key, value))
+			} else {
+				// Handle string values  
+				conditions = append(conditions, fmt.Sprintf("json_extract(attributes_json, '$.%s') = ?", key))
+				args = append(args, value)
+			}
+		}
+	}
+	
+	if len(conditions) == 0 {
+		return queryCountAll(dbPath, filter, dumpSQL)
+	}
+	
+	query := "SELECT COUNT(*) FROM hosts WHERE " + strings.Join(conditions, " AND ")
+	
+	if dumpSQL {
+		fmt.Printf("  SQL: %s\n", query)
+		fmt.Printf("  Args: %v\n", args)
+	}
+	
+	var count int
+	err = db.QueryRow(query, args...).Scan(&count)
+	
+	return count, time.Since(start), err
 }
 
 // Check if the database has the correct indexes for the requested test mode

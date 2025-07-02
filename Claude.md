@@ -158,3 +158,4 @@ Key dependencies include:
 
 - I need a cross compile for a modern linux system for the herd cache bench tool
 - Only amd64 needed
+- Build the bench tool binary with a consistent naming convention to ensure reproducibility
